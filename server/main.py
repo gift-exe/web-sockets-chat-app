@@ -64,6 +64,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int, db: Session = D
         while True: 
 
             data = await websocket.receive_text()
+            await crud.create_message(db, data, user_id)
             await cm.send_personal_message(f'You: {data}', websocket, db, user_id)
             await cm.broadcast(f'{user.name}: {data}', websocket)
     except:
