@@ -1,48 +1,81 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from typing import List
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import (FastAPI, 
+                     Request, 
+                     WebSocket,
+                     HTTPException,
+                     Depends)
+from sqlalchemy.orm import Session
+
+import crud, models, schemas
+from ws_manager import ConnectionManager
+from db import SessionLocal, engine
+
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
-templates = Jinja2Templates(directory='templates')
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-    
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
-
-    async def broadcast(self, message: str, websocket: WebSocket):
-
-        for connection in self.active_connections:
-            if (connection == websocket):
-                continue
-            await connection.send_text(message)
-
 cm = ConnectionManager()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @app.get('/')
 def read_index():
     return {'message':'api online'}
 
-@app.websocket('/ws/{client_id}')
-async def websocket_endpoint(websocket: WebSocket, client_id: int):
+@app.post('/signup')
+def signup(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = crud.get_user_by_name(db, user.name)
+
+    if db_user:
+        raise HTTPException(status_code=400, detail="Name already exists")
+
+    return crud.create_user(db, user)
+
+@app.post('/login')
+def login(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = crud.get_user_by_name(db, user.name)
+
+    if not db_user:
+        raise HTTPException(status_code=400, detail="Incorrect Logins")
+    
+    if user.password != db_user.password:
+        raise HTTPException(status_code=400, detail="Incorrect Logins")
+    
+    return db_user
+
+@app.websocket('/ws/{user_id}')
+async def websocket_endpoint(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
     #accept connections
     await cm.connect(websocket)
 
+    user = crud.get_user(db, user_id)
+
+    if user is None:
+        cm.disconnect(websocket)
+        return {'Error': 'User does not exist'}
+
     try:
+        #send past messages
+        send_past_messages(db, user.id)
+
         while True: 
+
             data = await websocket.receive_text()
-            await cm.send_personal_message(f'You: {data}', websocket)
-            await cm.broadcast(f'Client #{client_id}: {data}', websocket)
+            await cm.send_personal_message(f'You: {data}', websocket, db, user_id)
+            await cm.broadcast(f'{user.name}: {data}', websocket)
     except:
         cm.disconnect(websocket)
-        await cm.broadcast(f'Client #{client_id} left the chat', websocket)
+        await cm.broadcast(f'{user.name} left the chat', websocket)
+
+def send_past_messages(db: Session, user_id: int):
+    messages = crud.get_messages(db)
+
+    for message in messages:
+        if message.sender_id == user_id:
+            cm.send_personal_message(f'You: {message.text}')
+        else:
+            cm.send_personal_message(f'{crud.get_user(db, message.sender_id).name}: {message.text}')
+            
